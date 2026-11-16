@@ -1,0 +1,93 @@
+name: Sync upstream (deepseek-ai/deepseek-harness)
+
+# 每天检查一次上游；有更新就合并进本 fork。
+# 手动触发可带 dry_run=true 只检查不合并。
+
+on:
+  schedule:
+    # 03:00 Asia/Shanghai（前一天 19:00 UTC）
+    - cron: "0 19 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "只检查是否有更新，不执行合并"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check & merge upstream
+        uses: actions/github-script@v7
+        env:
+          UPSTREAM: deepseek-ai/deepseek-harness
+          BRANCH: master
+          DRY_RUN: ${{ inputs.dry_run || 'false' }}
+        with:
+          script: |
+            const [upOwner, upRepo] = process.env.UPSTREAM.split('/');
+            const branch = process.env.BRANCH;
+            const { owner, repo } = context.repo;
+
+            const up = await github.rest.repos.getBranch({ owner: upOwner, repo: upRepo, branch });
+            const upstreamSha = up.data.commit.sha;
+            const mine = await github.rest.repos.getBranch({ owner, repo, branch });
+            const localSha = mine.data.commit.sha;
+
+            core.info(`upstream: ${upstreamSha.slice(0, 10)} @ ${up.data.commit.commit.author.date}`);
+            core.info(`fork    : ${localSha.slice(0, 10)} @ ${mine.data.commit.commit.author.date}`);
+
+            if (upstreamSha === localSha) {
+              core.notice('已是最新，无需同步。');
+              return;
+            }
+            core.notice('检测到上游有新提交。');
+
+            if (String(process.env.DRY_RUN).toLowerCase() === 'true') {
+              core.notice('dry_run=true，跳过合并。');
+              return;
+            }
+
+            try {
+              const res = await github.rest.repos.mergeUpstream({ owner, repo, branch });
+              core.notice(`同步成功：merge_type=${res.data.merge_type}，分支 ${res.data.base_branch}`);
+            } catch (err) {
+              core.warning(`merge-upstream 失败（HTTP ${err.status}）：${err.message}`);
+              if (err.status !== 409) throw err;
+
+              // 409 = 有冲突，退回开 PR 让用户在网页解决
+              const body = [
+                '自动同步无法快进：上游改动与本 fork 存在冲突。',
+                '',
+                `- 上游：\`${process.env.UPSTREAM}@${upstreamSha.slice(0, 10)}\``,
+                `- 本 fork：\`${localSha.slice(0, 10)}\``,
+                '',
+                '请在本 PR 页面解决冲突后合并；若本 fork 已不需要改动，也可直接关闭 PR 并在设置里执行一次同步。',
+              ].join('\n');
+              try {
+                const pr = await github.rest.pulls.create({
+                  owner, repo,
+                  head: `${upOwner}:${branch}`,
+                  base: branch,
+                  title: `⬆️ 上游同步需手动解决冲突 (${new Date().toISOString().slice(0, 10)})`,
+                  body,
+                });
+                core.notice(`已创建 PR #${pr.data.number}，请手动解决冲突：${pr.data.html_url}`);
+              } catch (e) {
+                if (e.status === 422) {
+                  core.notice('同步 PR 已存在，跳过创建。');
+                  return;
+                }
+                throw e;
+              }
+            }
