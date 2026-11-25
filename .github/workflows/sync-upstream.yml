@@ -4,9 +4,14 @@ name: Sync upstream (deepseek-ai/deepseek-harness)
 # 手动触发可带 dry_run=true 只检查不合并。
 
 on:
-  schedule:
-    # 03:00 Asia/Shanghai（前一天 19:00 UTC）
-    - cron: "0 19 * * *"
+  # 定时同步已停用（2026-11-25）。原因：mergeUpstream 用 GITHUB_TOKEN 合并含
+  # workflow 改动的上游提交会被拒（422 refusing to allow a GitHub App to create
+  # or update workflow ... without `workflows` permission），permissions 里写不出
+  # workflows 这个键，所以只要上游动了 .github/workflows/* 就必然失败，每天发一封
+  # 失败邮件。要恢复定时同步，得改用 PAT secret 推送，然后把下面注释放开。
+  # schedule:
+  #   # 03:00 Asia/Shanghai（前一天 19:00 UTC）
+  #   - cron: "0 19 * * *"
   workflow_dispatch:
     inputs:
       dry_run:
