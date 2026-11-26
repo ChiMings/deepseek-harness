@@ -20,7 +20,7 @@ name: Sync upstream (deepseek-ai/deepseek-harness)
 on:
   schedule:
     # 03:00 Asia/Shanghai（前一天 19:00 UTC）
-    - cron: "*/10 * * * *"  # TEMP: 联调中，跑通后改回 0 19 * * *
+    - cron: "0 19 * * *"
   workflow_dispatch:
     inputs:
       dry_run:
