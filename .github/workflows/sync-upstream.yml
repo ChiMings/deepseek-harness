@@ -1,14 +1,20 @@
 name: Sync upstream (deepseek-ai/deepseek-harness)
 
-# 每天检查一次上游；有更新就合并进本 fork。
-# 手动触发可带 dry_run=true 只检查不合并。
+# 每天把上游 master 合并进本 fork。
+#
+# 为什么不用 POST /repos/{owner}/{repo}/merge-upstream：那个接口只能用
+# workflow 里的 GITHUB_TOKEN 调，一旦上游这轮改到了 .github/workflows/*，
+# 就会被 GitHub 拒掉（422 refusing to allow a GitHub App to create or update
+# workflow ... without `workflows` permission），而 workflow 的 permissions:
+# 里根本写不出 workflows 这个键——所以它每次上游动了 CI 文件就必然失败。
+#
+# 现在改成 git 合并 + 带 workflows 权限的 PAT 推送（仓库 secret
+# UPSTREAM_SYNC_TOKEN）。PAT 过期后这里会在 checkout/fetch 阶段 401/403，
+# 届时换一个新 token 写进 secret 即可。
 
 on:
-  # 定时同步已停用（2026-11-25）。原因：mergeUpstream 用 GITHUB_TOKEN 合并含
-  # workflow 改动的上游提交会被拒（422 refusing to allow a GitHub App to create
-  # or update workflow ... without `workflows` permission），permissions 里写不出
-  # workflows 这个键，所以只要上游动了 .github/workflows/* 就必然失败，每天发一封
-  # 失败邮件。要恢复定时同步，得改用 PAT secret 推送，然后把下面注释放开。
+  # TODO(2026-11-25): secret UPSTREAM_SYNC_TOKEN 就位、并手动跑通一次之后，
+  # 把下面两行注释放开恢复每天 03:00 自动同步。
   # schedule:
   #   # 03:00 Asia/Shanghai（前一天 19:00 UTC）
   #   - cron: "0 19 * * *"
@@ -19,9 +25,9 @@ on:
         type: boolean
         default: false
 
+# 推送用 PAT，GITHUB_TOKEN 这里只需要读；不给写权限。
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
 
 concurrency:
   group: upstream-sync
@@ -30,69 +36,83 @@ concurrency:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
-      - name: Check & merge upstream
-        uses: actions/github-script@v7
-        env:
-          UPSTREAM: deepseek-ai/deepseek-harness
-          BRANCH: master
-          DRY_RUN: ${{ inputs.dry_run || 'false' }}
+      - name: Checkout fork master
+        uses: actions/checkout@v4
         with:
-          script: |
-            const [upOwner, upRepo] = process.env.UPSTREAM.split('/');
-            const branch = process.env.BRANCH;
-            const { owner, repo } = context.repo;
+          ref: master
+          fetch-depth: 0
+          token: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
 
-            const up = await github.rest.repos.getBranch({ owner: upOwner, repo: upRepo, branch });
-            const upstreamSha = up.data.commit.sha;
-            const mine = await github.rest.repos.getBranch({ owner, repo, branch });
-            const localSha = mine.data.commit.sha;
+      - name: Merge upstream
+        id: merge
+        env:
+          UPSTREAM_REPO: deepseek-ai/deepseek-harness
+          DRY_RUN: ${{ inputs.dry_run || 'false' }}
+        run: |
+          set -euo pipefail
+          git config user.name  "upstream-sync-bot"
+          git config user.email "upstream-sync-bot@users.noreply.github.com"
 
-            core.info(`upstream: ${upstreamSha.slice(0, 10)} @ ${up.data.commit.commit.author.date}`);
-            core.info(`fork    : ${localSha.slice(0, 10)} @ ${mine.data.commit.commit.author.date}`);
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --no-tags --prune upstream master
 
-            if (upstreamSha === localSha) {
-              core.notice('已是最新，无需同步。');
-              return;
-            }
-            core.notice('检测到上游有新提交。');
+          UP=$(git rev-parse upstream/master)
+          LOCAL=$(git rev-parse HEAD)
+          echo "upstream = $UP"
+          echo "fork     = $LOCAL"
 
-            if (String(process.env.DRY_RUN).toLowerCase() === 'true') {
-              core.notice('dry_run=true，跳过合并。');
-              return;
-            }
+          if [ "$UP" = "$LOCAL" ]; then
+            echo "### 已是最新，无需同步。" >> "$GITHUB_STEP_SUMMARY"
+            echo "status=up-to-date" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
 
-            try {
-              const res = await github.rest.repos.mergeUpstream({ owner, repo, branch });
-              core.notice(`同步成功：merge_type=${res.data.merge_type}，分支 ${res.data.base_branch}`);
-            } catch (err) {
-              core.warning(`merge-upstream 失败（HTTP ${err.status}）：${err.message}`);
-              if (err.status !== 409) throw err;
+          if git merge-base --is-ancestor "$UP" HEAD; then
+            echo "### 上游提交已在 fork 中（fork 领先），无需同步。" >> "$GITHUB_STEP_SUMMARY"
+            echo "status=ahead-only" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
 
-              // 409 = 有冲突，退回开 PR 让用户在网页解决
-              const body = [
-                '自动同步无法快进：上游改动与本 fork 存在冲突。',
-                '',
-                `- 上游：\`${process.env.UPSTREAM}@${upstreamSha.slice(0, 10)}\``,
-                `- 本 fork：\`${localSha.slice(0, 10)}\``,
-                '',
-                '请在本 PR 页面解决冲突后合并；若本 fork 已不需要改动，也可直接关闭 PR 并在设置里执行一次同步。',
-              ].join('\n');
-              try {
-                const pr = await github.rest.pulls.create({
-                  owner, repo,
-                  head: `${upOwner}:${branch}`,
-                  base: branch,
-                  title: `⬆️ 上游同步需手动解决冲突 (${new Date().toISOString().slice(0, 10)})`,
-                  body,
-                });
-                core.notice(`已创建 PR #${pr.data.number}，请手动解决冲突：${pr.data.html_url}`);
-              } catch (e) {
-                if (e.status === 422) {
-                  core.notice('同步 PR 已存在，跳过创建。');
-                  return;
-                }
-                throw e;
-              }
-            }
+          if [ "$(echo "$DRY_RUN" | tr '[:upper:]' '[:lower:]')" = "true" ]; then
+            echo "### dry_run：上游有新提交 ${UP:0:10}，本次不合并。" >> "$GITHUB_STEP_SUMMARY"
+            echo "status=dry-run" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git merge --no-ff --no-commit upstream/master || true
+
+          if git ls-files -u | grep -q .; then
+            CONFLICTED=$(git diff --name-only --diff-filter=U | sed 's/^/  - /')
+            git merge --abort
+            {
+              echo "### 合并冲突，未推送"
+              echo ""
+              echo "上游改动与本 fork 的本地修改撞在同一处："
+              echo '```'
+              echo "$CONFLICTED"
+              echo '```'
+              echo ""
+              echo "本地处理：\`git remote add upstream https://github.com/${UPSTREAM_REPO}.git\`"
+              echo "\`git fetch upstream && git merge upstream/master\`，解完冲突再 \`git push\`。"
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "status=conflict" >> "$GITHUB_OUTPUT"
+            echo "::warning::上游合并冲突，未推送，详见 job summary"
+            exit 0
+          fi
+
+          CHANGED=$(git diff --cached --name-only | wc -l)
+          git commit -q -m "chore(sync): merge upstream ${UPSTREAM_REPO}@${UP:0:10} [skip ci]"
+          # [skip ci] 是故意的：同步提交不需要再触发一遍 push 工作流。
+          git push origin master
+
+          {
+            echo "### 同步成功"
+            echo ""
+            echo "- 上游：\`${UPSTREAM_REPO}@${UP:0:10}\`"
+            echo "- 合并提交：\`$(git rev-parse --short HEAD)\`"
+            echo "- 变更文件：${CHANGED} 个"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "status=merged" >> "$GITHUB_OUTPUT"
+          echo "head=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
