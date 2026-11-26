@@ -2,22 +2,25 @@ name: Sync upstream (deepseek-ai/deepseek-harness)
 
 # 每天把上游 master 合并进本 fork。
 #
-# 为什么不用 POST /repos/{owner}/{repo}/merge-upstream：那个接口只能用
-# workflow 里的 GITHUB_TOKEN 调，一旦上游这轮改到了 .github/workflows/*，
-# 就会被 GitHub 拒掉（422 refusing to allow a GitHub App to create or update
-# workflow ... without `workflows` permission），而 workflow 的 permissions:
-# 里根本写不出 workflows 这个键——所以它每次上游动了 CI 文件就必然失败。
+# 为什么不用 POST /repos/{owner}/{repo}/merge-upstream：那个接口只能用 workflow
+# 里的 GITHUB_TOKEN 调，一旦上游这轮改到 .github/workflows/*，就会被 GitHub 拒掉
+# （422 refusing to allow a GitHub App to create or update workflow ... without
+# `workflows` permission），而 workflow 的 permissions: 里根本写不出 workflows
+# 这个键——所以只要上游动了 CI 文件就必然失败，每天一封失败邮件。
 #
-# 现在改成 git 合并 + 带 workflows 权限的 PAT 推送（仓库 secret
-# UPSTREAM_SYNC_TOKEN）。PAT 过期后这里会在 checkout/fetch 阶段 401/403，
-# 届时换一个新 token 写进 secret 即可。
+# 现在改成 git 合并 + 推送，两种凭据自动适配：
+#   1) 仓库 secret UPSTREAM_SYNC_TOKEN（带 contents + workflows 写的 PAT）优先，
+#      能连 .github/workflows 一起同步；
+#   2) 没有该 secret 时退回 github.token，此时 GitHub 会拒绝推送 workflow 改动，
+#      脚本自动把这些文件还原成 fork 自己的版本再推送，其余文件照常同步，
+#      并在 job summary 里标明「本次跳过 .github/workflows」。
+#
+# 所以 secret 可有可无：有了就全量同步，没有也不会报错。
 
 on:
-  # TODO(2026-11-25): secret UPSTREAM_SYNC_TOKEN 就位、并手动跑通一次之后，
-  # 把下面两行注释放开恢复每天 03:00 自动同步。
-  # schedule:
-  #   # 03:00 Asia/Shanghai（前一天 19:00 UTC）
-  #   - cron: "0 19 * * *"
+  schedule:
+    # 03:00 Asia/Shanghai（前一天 19:00 UTC）
+    - cron: "*/10 * * * *"  # TEMP: 联调中，跑通后改回 0 19 * * *
   workflow_dispatch:
     inputs:
       dry_run:
@@ -25,9 +28,9 @@ on:
         type: boolean
         default: false
 
-# 推送用 PAT，GITHUB_TOKEN 这里只需要读；不给写权限。
+# github.token 回退路径需要 contents: write 才能推；（有 PAT 时这条用不上）
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: upstream-sync
@@ -43,7 +46,7 @@ jobs:
         with:
           ref: master
           fetch-depth: 0
-          token: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+          token: ${{ secrets.UPSTREAM_SYNC_TOKEN || github.token }}
 
       - name: Merge upstream
         id: merge
@@ -65,22 +68,20 @@ jobs:
 
           if [ "$UP" = "$LOCAL" ]; then
             echo "### 已是最新，无需同步。" >> "$GITHUB_STEP_SUMMARY"
-            echo "status=up-to-date" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           if git merge-base --is-ancestor "$UP" HEAD; then
             echo "### 上游提交已在 fork 中（fork 领先），无需同步。" >> "$GITHUB_STEP_SUMMARY"
-            echo "status=ahead-only" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           if [ "$(echo "$DRY_RUN" | tr '[:upper:]' '[:lower:]')" = "true" ]; then
             echo "### dry_run：上游有新提交 ${UP:0:10}，本次不合并。" >> "$GITHUB_STEP_SUMMARY"
-            echo "status=dry-run" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
+          PRE_MERGE=$(git rev-parse HEAD)
           git merge --no-ff --no-commit upstream/master || true
 
           if git ls-files -u | grep -q .; then
@@ -94,25 +95,43 @@ jobs:
               echo "$CONFLICTED"
               echo '```'
               echo ""
-              echo "本地处理：\`git remote add upstream https://github.com/${UPSTREAM_REPO}.git\`"
+              echo "本地处理：\`git remote add upstream https://github.com/${UPSTREAM_REPO}.git\`，"
               echo "\`git fetch upstream && git merge upstream/master\`，解完冲突再 \`git push\`。"
             } >> "$GITHUB_STEP_SUMMARY"
-            echo "status=conflict" >> "$GITHUB_OUTPUT"
             echo "::warning::上游合并冲突，未推送，详见 job summary"
             exit 0
           fi
 
-          CHANGED=$(git diff --cached --name-only | wc -l)
           git commit -q -m "chore(sync): merge upstream ${UPSTREAM_REPO}@${UP:0:10} [skip ci]"
-          # [skip ci] 是故意的：同步提交不需要再触发一遍 push 工作流。
-          git push origin master
+
+          ERR=$(mktemp)
+          if git push origin HEAD:master 2>"$ERR"; then
+            MODE="full"
+          else
+            if ! grep -qiE 'workflows?.?permission|refusing to allow' "$ERR"; then
+              cat "$ERR" >&2
+              echo "### 推送失败（非 workflows 权限问题）" >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
+            # github.token 没有 workflows 权限：把 CI 定义还原成 fork 自己的版本再推
+            echo "::notice::当前凭据没有 workflows 权限，本次跳过 .github/workflows 的更新"
+            git rm -rq --ignore-unmatch .github/workflows
+            git checkout "$PRE_MERGE" -- .github/workflows
+            git commit -q --amend -m "chore(sync): merge upstream ${UPSTREAM_REPO}@${UP:0:10} (skip .github/workflows) [skip ci]"
+            git push origin HEAD:master 2>"$ERR" || { cat "$ERR" >&2; exit 1; }
+            MODE="skip-workflows"
+          fi
+          rm -f "$ERR"
 
           {
-            echo "### 同步成功"
+            echo "### 同步成功（模式：${MODE}）"
             echo ""
             echo "- 上游：\`${UPSTREAM_REPO}@${UP:0:10}\`"
             echo "- 合并提交：\`$(git rev-parse --short HEAD)\`"
-            echo "- 变更文件：${CHANGED} 个"
+            echo "- 变更文件：$(git diff --stat "${PRE_MERGE}" HEAD | tail -1)"
           } >> "$GITHUB_STEP_SUMMARY"
-          echo "status=merged" >> "$GITHUB_OUTPUT"
-          echo "head=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          if [ "$MODE" = "skip-workflows" ]; then
+            echo ""
+            echo "> 想让 \`.github/workflows\` 也跟上游同步：加一个仓库 secret" >> "$GITHUB_STEP_SUMMARY"
+            echo "> \`UPSTREAM_SYNC_TOKEN\`（contents + workflows 写的 PAT），下次运行自动切换全量模式。" >> "$GITHUB_STEP_SUMMARY"
+          fi
